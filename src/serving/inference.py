@@ -25,6 +25,8 @@ Production Deployment:
 """
 
 import os
+from pathlib import Path
+
 import pandas as pd
 import mlflow
 
@@ -32,12 +34,48 @@ import mlflow
 # IMPORTANT: This path is set during Docker container build
 # In development: uses local MLflow artifacts
 # In production: uses model copied to container at build time
-MODEL_DIR = "/app/model"
+
+
+# Project root directory
+BASE_DIR = Path(__file__).resolve().parents[2]
+
+# Docker uses /app/model; Windows uses the saved local MLflow model
+# Docker deployment model directory
+DOCKER_MODEL_DIR = Path("/app/model")
+
+# GitHub-tracked deployment model directory
+DEPLOYMENT_MODEL_DIR = (
+    BASE_DIR
+    / "src"
+    / "serving"
+    / "model"
+    / "deployment_model"
+)
+
+# Original MLflow directory (local fallback)
+LOCAL_MODEL_DIR = (
+    BASE_DIR
+    / "mlruns"
+    / "448585764050151295"
+    / "07b1e21bee924419b25775c9a9941281"
+    / "artifacts"
+    / "model"
+)
+
+# Select the available model directory
+if DOCKER_MODEL_DIR.exists():
+    MODEL_DIR = str(DOCKER_MODEL_DIR)
+elif DEPLOYMENT_MODEL_DIR.exists():
+    MODEL_DIR = str(DEPLOYMENT_MODEL_DIR)
+else:
+    MODEL_DIR = str(LOCAL_MODEL_DIR)
+
+print(f"Loading model from: {MODEL_DIR}")
 
 try:
     # Load the trained XGBoost model in MLflow pyfunc format
     # This ensures compatibility regardless of the underlying ML library
-    model = mlflow.pyfunc.load_model(MODEL_DIR)
+    model = mlflow.sklearn.load_model(MODEL_DIR)
     print(f"✅ Model loaded successfully from {MODEL_DIR}")
 except Exception as e:
     print(f"❌ Failed to load model from {MODEL_DIR}: {e}")
@@ -59,13 +97,31 @@ except Exception as e:
 # === FEATURE SCHEMA LOADING ===
 # CRITICAL: Load the exact feature column order used during training
 # This ensures the model receives features in the expected order
-try:
-    feature_file = os.path.join(MODEL_DIR, "feature_columns.txt")
-    with open(feature_file) as f:
-        FEATURE_COLS = [ln.strip() for ln in f if ln.strip()]
-    print(f"✅ Loaded {len(FEATURE_COLS)} feature columns from training")
-except Exception as e:
-    raise Exception(f"Failed to load feature columns: {e}")
+# === FEATURE SCHEMA LOADING ===
+
+
+model_path = Path(MODEL_DIR)
+
+# Check both possible locations
+possible_paths = [
+    model_path / "feature_columns.txt",
+    model_path.parent / "feature_columns.txt"
+]
+
+feature_file = next(
+    (path for path in possible_paths if path.exists()),
+    None
+)
+
+if feature_file is None:
+    raise FileNotFoundError(
+        f"feature_columns.txt not found. Checked: {possible_paths}"
+    )
+
+with open(feature_file, encoding="utf-8") as f:
+    FEATURE_COLS = [line.strip() for line in f if line.strip()]
+
+print(f"✅ Loaded {len(FEATURE_COLS)} feature columns from {feature_file}")
 
 # === FEATURE TRANSFORMATION CONSTANTS ===
 # CRITICAL: These mappings must exactly match those used in training
@@ -82,79 +138,131 @@ BINARY_MAP = {
 
 # Numeric columns that need type coercion
 NUMERIC_COLS = ["tenure", "MonthlyCharges", "TotalCharges"]
+# Same threshold selected during model validation
+CHURN_THRESHOLD = 0.50
+
 
 def _serve_transform(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Apply identical feature transformations as used during model training.
-    
-    This function is CRITICAL for production ML - it ensures that features are
-    transformed exactly as they were during training to prevent train/serve skew.
-    
-    Transformation Pipeline:
-    1. Clean column names and handle data types
-    2. Apply deterministic binary encoding (using BINARY_MAP)
-    3. One-hot encode remaining categorical features  
-    4. Convert boolean columns to integers
-    5. Align features with training schema and order
-    
-    Args:
-        df: Single-row DataFrame with raw customer data
-        
-    Returns:
-        DataFrame with features transformed and ordered for model input
-        
-    IMPORTANT: Any changes to this function must be reflected in training
-    feature engineering to maintain consistency.
+    Transform one raw customer row using the exact training feature schema.
     """
+
     df = df.copy()
-    
-    # Clean column names (remove any whitespace)
     df.columns = df.columns.str.strip()
-    
-    # === STEP 1: Numeric Type Coercion ===
-    # Ensure numeric columns are properly typed (handle string inputs)
-    for c in NUMERIC_COLS:
-        if c in df.columns:
-            # Convert to numeric, replacing invalid values with NaN
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-            # Fill NaN with 0 (same as training preprocessing)
-            df[c] = df[c].fillna(0)
-    
-    # === STEP 2: Binary Feature Encoding ===
-    # Apply deterministic mappings for binary features
-    # CRITICAL: Must use exact same mappings as training
-    for c, mapping in BINARY_MAP.items():
-        if c in df.columns:
-            df[c] = (
-                df[c]
-                .astype(str)                    # Convert to string
-                .str.strip()                    # Remove whitespace
-                .map(mapping)                   # Apply binary mapping
-                .astype("Int64")                # Handle NaN values
-                .fillna(0)                      # Fill unknown values with 0
-                .astype(int)                    # Final integer conversion
+
+    # Start with all 30 training features set to zero.
+    encoded = pd.DataFrame(
+        0,
+        index=df.index,
+        columns=FEATURE_COLS,
+        dtype=int
+    )
+
+    # STEP 1: Numeric features
+    numeric_features = NUMERIC_COLS + ["SeniorCitizen"]
+
+    for col in numeric_features:
+        if col in df.columns and col in encoded.columns:
+            encoded[col] = (
+                pd.to_numeric(df[col], errors="coerce")
+                .fillna(0)
+                .astype(int if col == "SeniorCitizen" else float)
             )
-    
-    # === STEP 3: One-Hot Encoding for Remaining Categorical Features ===
-    # Find remaining object/categorical columns (not in BINARY_MAP)
-    obj_cols = [c for c in df.select_dtypes(include=["object"]).columns]
-    if obj_cols:
-        # Apply one-hot encoding with drop_first=True (same as training)
-        # This prevents multicollinearity by dropping the first category
-        df = pd.get_dummies(df, columns=obj_cols, drop_first=True)
-    
-    # === STEP 4: Boolean to Integer Conversion ===
-    # Convert any boolean columns to integers (XGBoost compatibility)
-    bool_cols = df.select_dtypes(include=["bool"]).columns
-    if len(bool_cols) > 0:
-        df[bool_cols] = df[bool_cols].astype(int)
-    
-    # === STEP 5: Feature Alignment with Training Schema ===
-    # CRITICAL: Ensure features are in exact same order as training
-    # Missing features get filled with 0, extra features are dropped
-    df = df.reindex(columns=FEATURE_COLS, fill_value=0)
-    
-    return df
+
+    # STEP 2: Binary features
+    for col, mapping in BINARY_MAP.items():
+        if col in df.columns and col in encoded.columns:
+            values = df[col].astype(str).str.strip()
+            encoded[col] = (
+                values.map(mapping)
+                .fillna(0)
+                .astype(int)
+            )
+
+    # STEP 3: Multi-category features
+    # The first category in training is the reference category.
+    category_mapping = {
+        "MultipleLines": {
+            "No": None,
+            "No phone service": "MultipleLines_No phone service",
+            "Yes": "MultipleLines_Yes"
+        },
+        "InternetService": {
+            "DSL": None,
+            "Fiber optic": "InternetService_Fiber optic",
+            "No": "InternetService_No"
+        },
+        "OnlineSecurity": {
+            "No": None,
+            "No internet service": "OnlineSecurity_No internet service",
+            "Yes": "OnlineSecurity_Yes"
+        },
+        "OnlineBackup": {
+            "No": None,
+            "No internet service": "OnlineBackup_No internet service",
+            "Yes": "OnlineBackup_Yes"
+        },
+        "DeviceProtection": {
+            "No": None,
+            "No internet service": "DeviceProtection_No internet service",
+            "Yes": "DeviceProtection_Yes"
+        },
+        "TechSupport": {
+            "No": None,
+            "No internet service": "TechSupport_No internet service",
+            "Yes": "TechSupport_Yes"
+        },
+        "StreamingTV": {
+            "No": None,
+            "No internet service": "StreamingTV_No internet service",
+            "Yes": "StreamingTV_Yes"
+        },
+        "StreamingMovies": {
+            "No": None,
+            "No internet service": "StreamingMovies_No internet service",
+            "Yes": "StreamingMovies_Yes"
+        },
+        "Contract": {
+            "Month-to-month": None,
+            "One year": "Contract_One year",
+            "Two year": "Contract_Two year"
+        },
+        "PaymentMethod": {
+            "Bank transfer (automatic)": None,
+            "Credit card (automatic)": "PaymentMethod_Credit card (automatic)",
+            "Electronic check": "PaymentMethod_Electronic check",
+            "Mailed check": "PaymentMethod_Mailed check"
+        }
+    }
+
+    for col, categories in category_mapping.items():
+        if col not in df.columns:
+            continue
+
+        value = df[col].iloc[0]
+
+        if pd.isna(value):
+            continue
+
+        value = str(value).strip()
+
+        if value not in categories:
+            raise ValueError(
+                f"Unknown category '{value}' for column '{col}'"
+            )
+
+        feature_name = categories[value]
+
+        if feature_name is not None:
+            if feature_name not in encoded.columns:
+                raise ValueError(
+                    f"Feature '{feature_name}' is missing from training schema"
+                )
+
+            encoded.loc[df.index[0], feature_name] = 1
+
+    # STEP 4: Return exact training columns and order.
+    return encoded[FEATURE_COLS]
 
 def predict(input_dict: dict) -> str:
     """
@@ -197,27 +305,24 @@ def predict(input_dict: dict) -> str:
     df_enc = _serve_transform(df)
     
     # === STEP 3: Generate Model Prediction ===
-    # Call the loaded MLflow model for inference
-    # The model returns predictions in various formats depending on the ML library
     try:
-        preds = model.predict(df_enc)
-        
-        # Normalize prediction output to consistent format
-        if hasattr(preds, "tolist"):
-            preds = preds.tolist()  # Convert numpy array to list
-            
-        # Extract single prediction value (for single-row input)
-        if isinstance(preds, (list, tuple)) and len(preds) == 1:
-            result = preds[0]
-        else:
-            result = preds
-            
+        # Get churn probabilities for the customer
+        probabilities = model.predict_proba(df_enc)
+
+        # Extract probability of churn (class 1)
+        churn_probability = float(probabilities[0][1])
+
+        # Apply the threshold selected during validation
+        result = int(churn_probability >= CHURN_THRESHOLD)
+
+        print(f"Churn probability: {churn_probability:.2%}")
+        print(f"Selected threshold: {CHURN_THRESHOLD}")
+
     except Exception as e:
         raise Exception(f"Model prediction failed: {e}")
-    
+
     # === STEP 4: Convert to Business-Friendly Output ===
-    # Convert binary prediction (0/1) to actionable business language
     if result == 1:
-        return "Likely to churn"      # High risk - needs intervention
+        return "Likely to churn"
     else:
-        return "Not likely to churn"  # Low risk - maintain normal service
+        return "Not likely to churn"

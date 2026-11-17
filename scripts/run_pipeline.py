@@ -10,11 +10,18 @@ import argparse
 import pandas as pd
 import mlflow
 import mlflow.sklearn
+from pathlib import Path
 from posthog import project_root
 from sklearn.model_selection import train_test_split
+
+
 from sklearn.metrics import (
-    classification_report, precision_score, recall_score,
-    f1_score, roc_auc_score
+    classification_report,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    confusion_matrix
 )
 from xgboost import XGBClassifier
 
@@ -36,8 +43,10 @@ def main(args):
     
     # === MLflow Setup - ESSENTIAL for experiment tracking ===
     # Configure MLflow to use local file-based tracking (not a tracking server)
+    
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    mlruns_path = args.mlflow_uri or f"file://{project_root}/mlruns"  # Local file-based tracking
+    # Create a valid file URI for Windows
+    mlruns_path = args.mlflow_uri or (Path(project_root) / "mlruns").as_uri()  # Local file-based tracking
     mlflow.set_tracking_uri(mlruns_path)
     mlflow.set_experiment(args.experiment)  # Creates experiment if doesn't exist
 
@@ -46,7 +55,7 @@ def main(args):
         # === Log hyperparameters and configuration ===
         # REQUIRED: These parameters are essential for model reproducibility
         mlflow.log_param("model", "xgboost")           # Model type for comparison
-        mlflow.log_param("threshold", args.threshold)   # Classification threshold (default: 0.35)
+      
         mlflow.log_param("test_size", args.test_size)   # Train/test split ratio
 
         # === STAGE 1: Data Loading & Validation ===
@@ -123,13 +132,32 @@ def main(args):
         X = df_enc.drop(columns=[target])  # Feature matrix
         y = df_enc[target]                 # Target vector
         
-        # Stratified split to maintain class distribution in both sets
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, 
-            test_size=args.test_size,    # Default: 20% for testing
-            stratify=y,                  # Maintain class balance
-            random_state=42              # Reproducible splits
-        )
+        
+     
+        # First split: separate training data from test data
+        X_train_full, X_test, y_train_full, y_test = train_test_split(
+        X,
+        y,
+        test_size=args.test_size,
+        stratify=y,
+        random_state=42
+)      
+
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_train_full,
+    y_train_full,
+    test_size=0.25,
+    stratify=y_train_full,
+    random_state=42
+)
+
+        print(
+    f"Training: {len(X_train)} | "
+    f"Validation: {len(X_val)} | "
+    f"Testing: {len(X_test)}"
+)
+        
+        
         print(f"✅ Train: {X_train.shape[0]} samples | Test: {X_test.shape[0]} samples")
 
         # === CRITICAL: Handle Class Imbalance ===
@@ -169,35 +197,97 @@ def main(args):
         mlflow.log_metric("train_time", train_time)  # Track training performance
         print(f"✅ Model trained in {train_time:.2f} seconds")
 
-        # === STAGE 6: Model Evaluation ===
-        print("📊 Evaluating model performance...")
-        
+        # === STAGE 6: Validation-Based Threshold Selection ===
+        print("\n📊 Selecting best threshold using validation data...")
+
+        # Step 1: Get churn probabilities from validation data
+        val_proba = model.predict_proba(X_val)[:, 1]
+
+        # Step 2: Try different classification thresholds
+        thresholds = [0.20, 0.30, 0.35, 0.40, 0.50]
+        threshold_results = []
+
+        print("\n🎯 Validation Threshold Comparison:")
+        print("Threshold | Precision | Recall | F1 Score")
+        print("-" * 45)
+
+        for threshold in thresholds:
+            val_pred = (val_proba >= threshold).astype(int)
+
+            val_precision = precision_score(
+                y_val, val_pred, zero_division=0
+            )
+            val_recall = recall_score(
+                y_val, val_pred, zero_division=0
+            )
+            val_f1 = f1_score(
+                y_val, val_pred, zero_division=0
+            )
+
+            threshold_results.append({
+                "threshold": threshold,
+                "precision": val_precision,
+                "recall": val_recall,
+                "f1": val_f1
+            })
+
+            print(
+                f"   {threshold:.2f}    |"
+                f"   {val_precision:.3f}   |"
+                f"  {val_recall:.3f} |"
+                f"  {val_f1:.3f}"
+            )
+
+        # Step 3: Select threshold with the highest validation F1 score
+        best_result = max(
+            threshold_results,
+            key=lambda result: result["f1"]
+        )
+
+        best_threshold = best_result["threshold"]
+
+        print(f"\n✅ Best threshold: {best_threshold:.2f}")
+        print(f"   Validation Precision: {best_result['precision']:.3f}")
+        print(f"   Validation Recall: {best_result['recall']:.3f}")
+        print(f"   Validation F1: {best_result['f1']:.3f}")
+
+        # Save the selected threshold in MLflow
+        mlflow.log_param("threshold", best_threshold)
+        mlflow.log_metric("validation_precision", best_result["precision"])
+        mlflow.log_metric("validation_recall", best_result["recall"])
+        mlflow.log_metric("validation_f1", best_result["f1"])
+
+        # === FINAL TEST EVALUATION ===
+        print("\n📊 Evaluating final model on unseen test data...")
+
         # Generate predictions and track inference time
         t1 = time.time()
-        proba = model.predict_proba(X_test)[:, 1]  # Get probability of churn (class 1)
-        
-        # Apply classification threshold (default: 0.35, optimized for churn detection)
-        # Lower threshold = more sensitive to churn (higher recall, lower precision)
-        y_pred = (proba >= args.threshold).astype(int)
-        pred_time = time.time() - t1
-        mlflow.log_metric("pred_time", pred_time)  # Track inference performance
+        proba = model.predict_proba(X_test)[:, 1]
 
-        # === CRITICAL: Log Evaluation Metrics to MLflow ===
-        # These metrics are essential for model comparison and monitoring
-        precision = precision_score(y_test, y_pred)    # Of predicted churners, how many actually churned?
-        recall = recall_score(y_test, y_pred)          # Of actual churners, how many did we catch?
-        f1 = f1_score(y_test, y_pred)                  # Harmonic mean of precision and recall
-        roc_auc = roc_auc_score(y_test, proba)         # Area under ROC curve (threshold-independent)
-        
-        # Log all metrics for experiment tracking
+        # Apply the threshold selected using validation data
+        y_pred = (proba >= best_threshold).astype(int)
+
+        pred_time = time.time() - t1
+        mlflow.log_metric("pred_time", pred_time)
+
+        # Calculate final test metrics
+        precision = precision_score(y_test, y_pred, zero_division=0)
+        recall = recall_score(y_test, y_pred, zero_division=0)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+        roc_auc = roc_auc_score(y_test, proba)
+
+        # Log final test metrics to MLflow
         mlflow.log_metric("precision", precision)
-        mlflow.log_metric("recall", recall) 
+        mlflow.log_metric("recall", recall)
         mlflow.log_metric("f1", f1)
         mlflow.log_metric("roc_auc", roc_auc)
-        
-        print(f"🎯 Model Performance:")
-        print(f"   Precision: {precision:.3f} | Recall: {recall:.3f}")
-        print(f"   F1 Score: {f1:.3f} | ROC AUC: {roc_auc:.3f}")
+
+        print("\n🎯 Final Test Performance:")
+        print(f"   Selected Threshold: {best_threshold:.2f}")
+        print(f"   Precision: {precision:.3f}")
+        print(f"   Recall: {recall:.3f}")
+        print(f"   F1 Score: {f1:.3f}")
+        print(f"   ROC AUC: {roc_auc:.3f}")
 
         # === STAGE 7: Model Serialization and Logging ===
         print("💾 Saving model to MLflow...")
@@ -214,6 +304,11 @@ def main(args):
         print(f"   Inference time: {pred_time:.4f}s")
         print(f"   Samples per second: {len(X_test)/pred_time:.0f}")
         
+        
+        print(f"\n📊 Confusion Matrix:")
+        cm = confusion_matrix(y_test, y_pred)
+        print(cm)
+
         print(f"\n📈 Detailed Classification Report:")
         print(classification_report(y_test, y_pred, digits=3))
 
@@ -223,7 +318,7 @@ if __name__ == "__main__":
     p.add_argument("--input", type=str, required=True,
                    help="path to CSV (e.g., data/raw/Telco-Customer-Churn.csv)")
     p.add_argument("--target", type=str, default="Churn")
-    p.add_argument("--threshold", type=float, default=0.35)
+    
     p.add_argument("--test_size", type=float, default=0.2)
     p.add_argument("--experiment", type=str, default="Telco Churn")
     p.add_argument("--mlflow_uri", type=str, default=None,

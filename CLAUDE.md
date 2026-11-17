@@ -1,123 +1,391 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides project-specific guidance for Claude Code and other AI coding assistants working with this repository.
 
-## Commands
+# Project Overview
 
-### Training Pipeline
-```bash
-# Run the complete ML training pipeline
-python scripts/run_pipeline.py --input data/raw/Telco-Customer-Churn.csv --target Churn
+Telco Customer Churn Prediction is a machine learning application that predicts whether a telecommunications customer is likely to discontinue their service.
 
-# Prepare processed data only
-python scripts/prepare_processed_data.py
+The project uses:
+- XGBoost for customer churn classification.
+- Pandas and NumPy for data processing.
+- MLflow for experiment tracking and model artifacts.
+- FastAPI for backend inference.
+- Streamlit for the interactive frontend.
+- Docker for containerization.
+- GitHub Actions for automated project checks.
+
+The application uses separate frontend and backend services.
+
+**Important architecture rule:** Streamlit communicates with FastAPI through HTTP requests. Keep model inference centralized in `src/serving/inference.py`.
+
+# Technology Stack
+
+- **Language:** Python 3.11
+- **Machine Learning:** XGBoost, Scikit-learn
+- **Data Processing:** Pandas, NumPy
+- **Backend:** FastAPI
+- **Frontend:** Streamlit
+- **Experiment Tracking:** MLflow
+- **API Server:** Uvicorn
+- **Containerization:** Docker
+- **Testing:** Pytest
+- **CI/CD:** GitHub Actions
+
+# Project Architecture
+
+```text
+Customer
+   |
+   v
+Streamlit Frontend
+   |
+   | HTTP POST request
+   v
+FastAPI Backend
+   |
+   v
+Input Validation
+   |
+   v
+Inference Module
+   |
+   v
+Trained XGBoost Model
+   |
+   v
+Prediction Response
+   |
+   v
+Streamlit Frontend
 ```
 
-### Testing
-```bash
-# Test data processing and feature engineering
-python scripts/test_pipeline_phase1_data_features.py
+## Main Application Files
 
-# Test model training and evaluation
-python scripts/test_pipeline_phase2_modeling.py
+| File | Responsibility |
+|---|---|
+| `frontend/streamlit_app.py` | User interface |
+| `src/app/main.py` | FastAPI application and API endpoints |
+| `src/serving/inference.py` | Model loading and prediction logic |
+| `src/serving/model/deployment_model/` | Deployment-ready model artifacts |
+| `src/utils/validate_data.py` | Data validation utilities |
+| `scripts/run_pipeline.py` | Machine learning pipeline entry point |
+| `.github/workflows/ci.yml` | GitHub Actions workflow |
 
-# Test FastAPI endpoints
-python scripts/test_fastapi.py
+# Commands
+
+## Local Development Setup
+
+Create a virtual environment:
+
+```powershell
+python -m venv venv
 ```
 
-### Local Development
-```bash
-# Run the FastAPI + Gradio application locally
-python -m uvicorn src.app.main:app --host 0.0.0.0 --port 8000
+Activate on Windows PowerShell:
 
-# Alternative app entry point
-python -m uvicorn src.app.app:app --host 0.0.0.0 --port 8000
+```powershell
+.\venv\Scripts\Activate.ps1
 ```
 
-### Docker
-```bash
-# Build and run the containerized application
-docker build -t telco-churn-app .
-docker run -p 8000:8000 telco-churn-app
+If PowerShell blocks activation:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```
 
-## Architecture Overview
+Install dependencies:
 
-### ML Pipeline Flow
-This project implements a complete MLOps pipeline with two distinct phases:
+```powershell
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
 
-**Training Pipeline** (`scripts/run_pipeline.py`):
-1. **Data Loading** → **Data Validation** (Great Expectations) → **Preprocessing** → **Feature Engineering** → **XGBoost Training** → **MLflow Logging**
-2. All artifacts (model, feature columns, preprocessing logic) are stored in MLflow for reproducibility
+## Run FastAPI
 
-**Serving Pipeline** (`src/app/main.py` + `src/serving/inference.py`):
-1. **FastAPI REST API** (`/predict` endpoint) + **Gradio Web UI** (`/ui` endpoint) → **MLflow Model Loading** → **Feature Transformation** → **Prediction**
-2. Feature processing mirrors training-time transformations for consistency
+Start the backend:
 
-### MLflow Integration Patterns
-- **Experiment Name**: "Telco Churn" (default, can be overridden)
-- **Tracking URI**: File-based at `{project_root}/mlruns`
-- **Logged Artifacts**: `model/`, `feature_columns.txt`, `preprocessing.pkl`
-- **Tracked Metrics**: precision, recall, f1, roc_auc, train_time, pred_time, data_quality_pass
-- **Parameters**: model type, threshold (default 0.35), test_size (default 0.2)
+```powershell
+uvicorn src.app.main:app --reload
+```
 
-### Feature Engineering Consistency
-Critical pattern: Training and serving must use identical feature transformations.
+Backend address:
 
-**Training** (`src/features/build_features.py`):
-- Binary features (Yes/No, Male/Female) → deterministic 0/1 mapping
-- Multi-category features → one-hot encoding with `drop_first=True`
-- Boolean columns → integers
+```text
+http://127.0.0.1:8000
+```
 
-**Serving** (`src/serving/inference.py`):
-- Uses fixed `BINARY_MAP` dictionary for consistent binary encoding
-- Applies `pd.get_dummies()` with same parameters as training
-- Feature alignment via `FEATURE_COLS` from training artifacts
+Swagger documentation:
 
-### Model Loading and Serving
-- **Container Path**: Model loaded from `/app/model` (MLflow pyfunc format)
-- **Feature Order**: Enforced using `feature_columns.txt` from training
-- **Prediction Format**: Returns "Likely to churn" or "Not likely to churn" strings
+```text
+http://127.0.0.1:8000/docs
+```
 
-### Data Validation
-- **Tool**: Great Expectations with custom validation suite
-- **Location**: `src/utils/validate_data.py`
-- **Checks**: CustomerID presence, gender values, numeric ranges for tenure/charges
-- **Integration**: Results logged to MLflow as `data_quality_pass` metric
+## Run Streamlit
 
-### Docker Containerization
-- **Base Image**: `python:3.11-slim`
-- **Key Setting**: `PYTHONPATH=/app/src` for proper module imports
-- **Model Artifacts**: Specific MLflow run copied to `/app/model` during build
-- **Serving**: uvicorn with FastAPI app on port 8000
+Open a second terminal, activate the virtual environment, and run:
 
-### CI/CD Pipeline
-- **Trigger**: Push to main branch
-- **Actions**: Build Docker image → Push to Docker Hub (`anasriad8/telco-fastapi:latest`)
-- **Requirements**: `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` secrets
-- **Deployment**: Manual ECS service update (AWS Fargate + ALB)
+```powershell
+streamlit run frontend/streamlit_app.py
+```
 
-## Key Implementation Details
+Frontend address:
 
-### XGBoost Model Configuration
-Optimized hyperparameters are hardcoded in `scripts/run_pipeline.py:100-110`:
-- `n_estimators=301`, `learning_rate=0.034`, `max_depth=7`
-- `scale_pos_weight` calculated dynamically for class imbalance handling
+```text
+http://localhost:8501
+```
 
-### API Endpoints
-- `GET /` - Health check returning `{"status": "ok"}`
-- `POST /predict` - Accepts `CustomerData` Pydantic model with 18 customer attributes
-- `/ui` - Gradio interface mounted via `gr.mount_gradio_app()`
+The frontend uses the `API_URL` environment variable to communicate with the backend.
 
-### File System Layout
-- `data/raw/` - Original datasets
-- `data/processed/` - Cleaned datasets
-- `mlruns/` - MLflow experiment tracking database
-- `artifacts/` - Shared preprocessing artifacts (`feature_columns.json`, `preprocessing.pkl`)
-- `src/serving/model/` - Local MLflow run copies for development
+Default local prediction endpoint:
 
-### Development Notes
-- No formal test suite exists; use manual test scripts in `scripts/test_*.py`
-- MLflow UI can be accessed with: `mlflow ui --backend-store-uri file:./mlruns`
-- The project uses file-based MLflow tracking (not a tracking server)
-- Model serving expects exact feature column order from training time
+```text
+http://127.0.0.1:8000/predict
+```
+
+Do not hardcode a cloud URL into the frontend. Configure the URL through the environment variable when deploying.
+
+# API Endpoints
+
+The FastAPI application provides:
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/` | Application root |
+| GET | `/health` | Health check |
+| POST | `/predict` | Customer churn prediction |
+| GET | `/docs` | Swagger documentation |
+
+Always inspect `src/app/main.py` and the Pydantic request model before changing API request or response structures.
+
+Do not assume the frontend and backend share the same process.
+
+# Machine Learning Pipeline
+
+The training pipeline entry point is:
+
+```text
+scripts/run_pipeline.py
+```
+
+The general workflow includes:
+
+1. Load the customer churn dataset.
+2. Validate the data.
+3. Perform data preprocessing.
+4. Apply feature engineering.
+5. Train the XGBoost classification model.
+6. Evaluate model performance.
+7. Track experiment information and artifacts using MLflow.
+
+Before running or modifying pipeline commands, inspect the current script and its argument definitions.
+
+Dataset location:
+
+```text
+src/data/raw/Telco-Customer-Churn.csv
+```
+
+# Feature Engineering
+
+Training and inference must use consistent feature transformations.
+
+The original feature-engineering implementation is located at:
+
+```text
+src/features/build_features.py
+```
+
+Inspect the current file before modifying it.
+
+Important requirements:
+
+- Maintain consistent binary feature mappings.
+- Apply categorical transformations consistently.
+- Preserve the expected feature columns.
+- Preserve the exact feature order used during training.
+- Avoid changing preprocessing logic without checking its impact on predictions.
+
+# Model Loading and Serving
+
+The centralized inference module is:
+
+```text
+src/serving/inference.py
+```
+
+The deployment-ready model artifacts are stored in:
+
+```text
+src/serving/model/deployment_model/
+```
+
+Important deployment artifacts include:
+
+- `model.pkl`
+- `MLmodel`
+- `feature_columns.txt`
+- `conda.yaml`
+- `python_env.yaml`
+- `requirements.txt`
+- `metadata/`
+
+The Docker API image copies the deployment artifacts to:
+
+```text
+/app/model/
+```
+
+The inference module supports selecting the model directory based on the available environment:
+
+1. Docker model directory: `/app/model`
+2. Repository deployment model directory: `src/serving/model/deployment_model`
+3. Original local MLflow model artifact directory as fallback
+
+Do not delete or overwrite existing historical MLflow model runs without explicit approval.
+
+The inference module uses the saved feature-column list to align incoming customer data with the model's expected input structure.
+
+**Important:** The current inference implementation uses a classification threshold of `0.50`. Do not change this threshold unless the model configuration and prediction behavior have been reviewed and tested.
+
+Load the model once during application startup where supported. Avoid repeatedly loading model artifacts for every prediction request.
+
+# MLflow Integration
+
+MLflow is used for experiment tracking and model artifact management.
+
+Original tracking location:
+
+```text
+mlruns/
+```
+
+MLflow may contain:
+
+- Trained model artifacts.
+- Model configuration.
+- Feature-column information.
+- Experiment metrics.
+- Run parameters.
+- Training metadata.
+
+Tracked metrics in the original pipeline include:
+
+- Precision
+- Recall
+- F1-score
+- ROC-AUC
+- Training time
+- Prediction time
+- Data quality status
+
+Inspect the current training configuration before changing experiment names, metric definitions, or model parameters.
+
+The deployment model in `src/serving/model/deployment_model/` must remain available independently of the local `mlruns/` directory.
+
+# Data Validation
+
+Data validation utilities are located in:
+
+```text
+src/utils/validate_data.py
+```
+
+Inspect the implementation before changing validation rules.
+
+The original validation logic includes checks such as:
+
+- Customer ID presence.
+- Valid gender values.
+- Numeric ranges for tenure and charges.
+- Dataset quality requirements.
+
+Keep validation consistent with the training and inference workflows.
+
+# Docker Configuration
+
+The project has two separate Dockerfiles.
+
+## FastAPI Backend
+
+Dockerfile:
+
+```text
+Dockerfile.api
+```
+
+Build command:
+
+```powershell
+docker build -f Dockerfile.api -t telco-churn-api:latest .
+```
+
+The API container:
+- Uses Python 3.11 slim.
+- Runs the FastAPI application through Uvicorn.
+- Exposes port 8000 for local development.
+- Copies deployment model artifacts into `/app/model/`.
+
+## Streamlit Frontend
+
+Dockerfile:
+
+```text
+dockerfile
+```
+
+Build command:
+
+```powershell
+docker build -f dockerfile -t telco-churn-streamlit:latest .
+```
+
+The Streamlit container:
+- Runs the Streamlit application.
+- Uses port 8501 for local development.
+- Communicates with FastAPI using `API_URL`.
+
+## Docker Network
+
+The two containers communicate through:
+
+```text
+telco-network
+```
+
+Create the network if it does not already exist:
+
+```powershell
+docker network create telco-network
+```
+
+Start the API container:
+
+```powershell
+docker run -d --name telco-churn-api --network telco-network -p 8000:8000 telco-churn-api:latest
+```
+
+Start the Streamlit container:
+
+```powershell
+docker run -d --name telco-churn-streamlit --network telco-network -e API_URL=http://telco-churn-api:8000/predict -p 8501:8501 telco-churn-streamlit:latest
+```
+
+If containers with these names already exist, remove or rename the old containers before creating replacements.
+
+Verify containers:
+
+```powershell
+docker ps
+```
+
+View logs:
+
+```powershell
+docker logs telco-churn-api
+docker logs telco-churn-streamlit
+```
+
+Local application URLs:
+
+- Streamlit: `http://localhost

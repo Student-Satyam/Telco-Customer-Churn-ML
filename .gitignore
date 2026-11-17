@@ -1,9 +1,9 @@
-# venvs
+# Virtual environments
 .venv/
 venv/
 env/
 
-# OS cruft
+# OS files
 .DS_Store
 
 # Python cache
@@ -11,12 +11,18 @@ __pycache__/
 *.py[cod]
 *.pyo
 
-# Big artifacts we don't want in git
+# MLflow and generated artifacts
 mlruns/
 artifacts/
-data/raw/
-data/processed/
 
-# BUT keep our bundled serving model in the repo
-!src/serving/model/
-!src/serving/model/**
+# Ignore generated data folders at repository root
+/data/raw/
+/data/processed/
+
+# Keep the project dataset
+!/src/data/raw/
+!/src/data/raw/**
+
+# Keep bundled serving model
+!/src/serving/model/
+!/src/serving/model/**
