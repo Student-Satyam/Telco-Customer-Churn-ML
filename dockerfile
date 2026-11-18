@@ -27,4 +27,4 @@ ENV PYTHONUNBUFFERED=1 \
 EXPOSE 8501
 
 # 10. Start Streamlit
-CMD ["streamlit", "run", "frontend/streamlit_app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+CMD ["sh", "-c", "streamlit run frontend/streamlit_app.py --server.address=0.0.0.0 --server.port=${PORT:-8501}"]
